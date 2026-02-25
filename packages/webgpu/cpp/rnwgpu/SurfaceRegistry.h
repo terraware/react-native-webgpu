@@ -5,6 +5,11 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#include <pthread.h>
+#endif
+
 #include "webgpu/webgpu_cpp.h"
 
 namespace rnwgpu {
@@ -28,19 +33,47 @@ public:
   ~SurfaceInfo() { surface = nullptr; }
 
   void reconfigure(int newWidth, int newHeight) {
-    std::unique_lock<std::shared_mutex> lock(_mutex);
-    config.width = newWidth;
-    config.height = newHeight;
-    _configure();
+    wgpu::Surface surfaceCopy;
+    wgpu::SurfaceConfiguration configCopy;
+    bool hasSurface = false;
+    {
+      std::unique_lock<std::shared_mutex> lock(_mutex);
+      config.width = newWidth;
+      config.height = newHeight;
+      if (surface) {
+        surfaceCopy = surface;
+        configCopy = config;
+        hasSurface = true;
+      } else {
+        _createOffscreenTexture();
+      }
+    }
+    if (hasSurface) {
+      _configureSurfaceOnMainThread(surfaceCopy, configCopy);
+    }
   }
 
   void configure(wgpu::SurfaceConfiguration &newConfig) {
-    std::unique_lock<std::shared_mutex> lock(_mutex);
-    config = newConfig;
-    config.width = width;
-    config.height = height;
-    config.presentMode = wgpu::PresentMode::Fifo;
-    _configure();
+    wgpu::Surface surfaceCopy;
+    wgpu::SurfaceConfiguration configCopy;
+    bool hasSurface = false;
+    {
+      std::unique_lock<std::shared_mutex> lock(_mutex);
+      config = newConfig;
+      config.width = width;
+      config.height = height;
+      config.presentMode = wgpu::PresentMode::Fifo;
+      if (surface) {
+        surfaceCopy = surface;
+        configCopy = config;
+        hasSurface = true;
+      } else {
+        _createOffscreenTexture();
+      }
+    }
+    if (hasSurface) {
+      _configureSurfaceOnMainThread(surfaceCopy, configCopy);
+    }
   }
 
   void unconfigure() {
@@ -78,7 +111,12 @@ public:
     // surface
     if (texture != nullptr) {
       config.usage = config.usage | wgpu::TextureUsage::CopyDst;
-      _configure();
+      // switchToOnscreen is called from the main thread (MetalView), so
+      // this calls surface.Configure directly without dispatching.
+#ifdef __APPLE__
+      dispatch_assert_queue_debug(dispatch_get_main_queue());
+#endif
+      surface.configure(config);
       // We flush the offscreen texture to the onscreen one
       // TODO: there is a faster way to do this without validation?
       wgpu::CommandEncoderDescriptor encoderDesc;
@@ -152,19 +190,35 @@ public:
   }
 
 private:
-  void _configure() {
-    if (surface) {
-      surface.Configure(&config);
-    } else {
-      wgpu::TextureDescriptor textureDesc;
-      textureDesc.format = config.format;
-      textureDesc.size.width = config.width;
-      textureDesc.size.height = config.height;
-      textureDesc.usage = wgpu::TextureUsage::RenderAttachment |
-                          wgpu::TextureUsage::CopySrc |
-                          wgpu::TextureUsage::TextureBinding;
-      texture = config.device.CreateTexture(&textureDesc);
+  // Calls surface.Configure on the main thread. On Apple, if we are not
+  // already on the main thread, dispatches synchronously to avoid modifying
+  // CAMetalLayer properties from a background thread (Dawn's Metal SwapChain
+  // initialization touches the layer). Parameters are taken by value so the
+  // caller can release _mutex before calling this, avoiding deadlock.
+  static void _configureSurfaceOnMainThread(wgpu::Surface s,
+                                            wgpu::SurfaceConfiguration c) {
+#ifdef __APPLE__
+    if (!pthread_main_np()) {
+      dispatch_sync(dispatch_get_main_queue(), ^{
+        s.Configure(&c);
+      });
+      return;
     }
+#endif
+    s.Configure(&c);
+  }
+
+  // Creates an offscreen texture from the current config. Must be called
+  // with _mutex held.
+  void _createOffscreenTexture() {
+    wgpu::TextureDescriptor textureDesc;
+    textureDesc.format = config.format;
+    textureDesc.size.width = config.width;
+    textureDesc.size.height = config.height;
+    textureDesc.usage = wgpu::TextureUsage::RenderAttachment |
+                        wgpu::TextureUsage::CopySrc |
+                        wgpu::TextureUsage::TextureBinding;
+    texture = config.device.CreateTexture(&textureDesc);
   }
 
   mutable std::shared_mutex _mutex;
